@@ -1,1 +1,6 @@
 *env
+*crt
+*key
+__pycache__/
+.vscode/
+.DS_Store
