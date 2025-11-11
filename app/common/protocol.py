@@ -7,3 +7,15 @@ class HelloMessage(BaseModel):
     type: str
     cert: str
     nonce: str
+
+
+class DH_P_Q_Client(BaseModel):
+    type: str = "dh_client"
+    g: int
+    p: int
+    A: int
+
+
+class DH_Server_B(BaseModel):
+    type: str = "dh_server"
+    B: int
