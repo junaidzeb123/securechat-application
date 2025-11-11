@@ -1,26 +1,25 @@
 """Issue server/client cert signed by Root CA (SAN=DNSName(CN))."""
 
-import socket
-import json
+import os
 from typing import Optional
+from datetime import datetime, timedelta
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 from cryptography.x509 import (
     Name,
     NameAttribute,
-    NameOID,
     CertificateBuilder,
     BasicConstraints,
     KeyUsage,
     ExtendedKeyUsage,
-    ExtendedKeyUsageOID,
+    SubjectAlternativeName,
+    DNSName,
     random_serial_number,
 )
-from datetime import datetime, timedelta
-from cryptography import x509
 
-# ------------------- Socket Server -------------------
-CA_HOST = "0.0.0.0"
-CA_PORT = 8000
+CERTS_ROOT_PATH = "../certs"
 
 
 # ------------------- Certificate Issuer -------------------
@@ -79,9 +78,9 @@ def issue_certificate(
         .add_extension(
             KeyUsage(
                 digital_signature=True,
-                key_encipherment=is_server,
-                content_commitment=not is_server,
-                data_encipherment=is_server,
+                key_encipherment=True,
+                content_commitment=False,
+                data_encipherment=False,
                 key_agreement=False,
                 key_cert_sign=False,
                 crl_sign=False,
@@ -92,73 +91,117 @@ def issue_certificate(
         )
     )
 
+    # Extended Key Usage
     eku = ExtendedKeyUsage(
-        [
-            ExtendedKeyUsageOID.SERVER_AUTH
-            if is_server
-            else ExtendedKeyUsageOID.CLIENT_AUTH
-        ]
+        [ExtendedKeyUsageOID.SERVER_AUTH if is_server else ExtendedKeyUsageOID.CLIENT_AUTH]
     )
     cert_builder = cert_builder.add_extension(eku, critical=False)
 
-    certificate = cert_builder.sign(
-        private_key=ca_private_key, algorithm=hashes.SHA256()
+    # Subject Alternative Name (SAN)
+    cert_builder = cert_builder.add_extension(
+        SubjectAlternativeName([DNSName(subject_common_name)]), critical=False
     )
+
+    # Sign the certificate
+    certificate = cert_builder.sign(private_key=ca_private_key, algorithm=hashes.SHA256())
     certificate_pem = certificate.public_bytes(serialization.Encoding.PEM)
 
     return certificate_pem
 
 
-def start_ca_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((CA_HOST, CA_PORT))
-        s.listen(5)
-        print(f"CA server listening on {CA_HOST}:{CA_PORT}")
+# ------------------- Key Management -------------------
+def save_key(public_key, private_key, party: str):
+    """
+    Save RSA key pair for a given party (client/server).
+    """
+    assert party in ("client", "server")
 
-        while True:
-            conn, addr = s.accept()
-            with conn:
-                print(f"Connected by {addr}")
-                data = b""
+    os.makedirs(CERTS_ROOT_PATH, exist_ok=True)
 
-                data = conn.recv(4096)
+    # Save private key
+    with open(f"{CERTS_ROOT_PATH}/{party}_private_key.pem", "wb") as f:
+        f.write(
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.BestAvailableEncryption(
+                    b"my_secure_password"
+                ),
+            )
+        )
 
-                # Decode JSON request
-                try:
-                    request = json.loads(data.decode())
-                    subject_public_key_pem = request["public_key"].encode()
-                    subject_common_name = request.get("common_name", "Unknown")
-                    subject_email = request.get("email")
-                    country = request.get("country")
-                    state = request.get("state")
-                    locality = request.get("locality")
-                    organization = request.get("organization")
-                    is_server = request.get("is_server", True)
-                    validity_days = request.get("validity_days", 1)
-
-                    # Issue certificate
-                    cert_pem = issue_certificate(
-                        ca_key_path="rootCA.key",
-                        ca_cert_path="rootCA.crt",
-                        subject_public_key_pem=subject_public_key_pem,
-                        subject_common_name=subject_common_name,
-                        subject_email=subject_email,
-                        country=country,
-                        state=state,
-                        locality=locality,
-                        organization=organization,
-                        is_server=is_server,
-                        validity_days=validity_days,
-                    )
-
-                    # Send back certificate
-                    conn.sendall(cert_pem)
-                    print(f"Certificate issued for {subject_common_name}")
-                except Exception as e:
-                    error_msg = f"Error: {str(e)}"
-                    conn.sendall(error_msg.encode())
+    # Save public key
+    with open(f"{CERTS_ROOT_PATH}/{party}_public_key.pem", "wb") as f:
+        f.write(
+            public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
 
 
-# ------------------- Run Server -------------------
+def generate_key_pair():
+    """Generate an RSA private/public key pair."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_key, public_key, public_pem
+
+
+# ------------------- Certificate Generation -------------------
+def generate_and_save_certificate_server(public_key_pem):
+    """Generate and save the server certificate."""
+
+    cert_pem = issue_certificate(
+        ca_key_path=f"{CERTS_ROOT_PATH}/rootCA.key",
+        ca_cert_path=f"{CERTS_ROOT_PATH}/rootCA.crt",
+        subject_public_key_pem=public_key_pem,
+        subject_common_name="server",
+        subject_email="server@gmail.com",
+        country="PK",
+        organization="FAST",
+        is_server=True,
+        validity_days=1,
+    )
+
+    with open(f"{CERTS_ROOT_PATH}/server_cert.crt", "wb") as f:
+        f.write(cert_pem)
+
+
+def generate_and_save_certificate_client(public_key_pem):
+    """Generate and save the client certificate."""
+
+    cert_pem = issue_certificate(
+        ca_key_path=f"{CERTS_ROOT_PATH}/rootCA.key",
+        ca_cert_path=f"{CERTS_ROOT_PATH}/rootCA.crt",
+        subject_public_key_pem=public_key_pem,
+        subject_common_name="client",
+        subject_email="client@gmail.com",
+        country="PK",
+        organization="FAST",
+        is_server=False,
+        validity_days=1,
+    )
+
+    with open(f"{CERTS_ROOT_PATH}/client_cert.crt", "wb") as f:
+        f.write(cert_pem)
+
+
+# ------------------- Execute -------------------
+def execute():
+    client_priv, client_pub, client_pub_pem = generate_key_pair()
+    server_priv, server_pub, server_pub_pem = generate_key_pair()
+
+    save_key(client_pub, client_priv, "client")
+    save_key(server_pub, server_priv, "server")
+
+    generate_and_save_certificate_client(public_key_pem=client_pub_pem)
+    generate_and_save_certificate_server(public_key_pem=server_pub_pem)
+
+
 if __name__ == "__main__":
-    start_ca_server()
+    execute()
