@@ -1,149 +1,195 @@
-"""Client skeleton — plain TCP; no TLS. See assignment spec."""
-
-from typing import Any
+# client.py
 import socket
-import os
 import json
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
-
-from common.protocol import HelloMessage, DH_P_Q_Client
-from common.utils import verify_server_certificate
-from pydantic import BaseModel
+import os
+import secrets
+import hashlib
+from typing import Any, Dict
+from cryptography.hazmat.primitives.asymmetric import rsa, dh
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers import aead
+from cryptography import x509
 
 HOST = "127.0.0.1"
 PORT = 9000
-
 CA_HOST = "127.0.0.1"
 CA_PORT = 8000
-cert = b""
 
+def send_msg(sock: socket.socket, obj: Any):
+    data = json.dumps(obj).encode()
+    length = len(data).to_bytes(4, "big")
+    sock.sendall(length + data)
+
+def recv_msg(sock: socket.socket) -> Any:
+    raw_len = sock.recv(4)
+    if not raw_len:
+        return None
+    length = int.from_bytes(raw_len, "big")
+    chunks = b""
+    while len(chunks) < length:
+        chunk = sock.recv(length - len(chunks))
+        if not chunk:
+            raise ConnectionError("Socket closed")
+        chunks += chunk
+    return json.loads(chunks.decode())
+
+def load_ca_cert() -> x509.Certificate:
+    with open("rootCA.crt", "rb") as f:
+        return x509.load_pem_x509_certificate(f.read())
+
+def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool:
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    try:
+        ca_cert.public_key().verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            serialization.pkcs1v15 if False else __import__("cryptography").hazmat.primitives.asymmetric.padding.PKCS1v15(),
+            cert.signature_hash_algorithm,
+        )
+        return True
+    except Exception:
+        # the above construct is awkward to avoid explicit import misuse — use a simpler verify in practice
+        try:
+            ca_cert.public_key().verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                # Use padding PKCS1v15 directly:
+                __import__("cryptography").hazmat.primitives.asymmetric.padding.PKCS1v15(),
+                cert.signature_hash_algorithm,
+            )
+            return True
+        except Exception as e:
+            print("[Client] Certificate verification error:", e)
+            return False
+
+def aes_gcm_encrypt(key: bytes, plaintext: bytes) -> Dict[str, str]:
+    iv = secrets.token_bytes(12)
+    aesgcm = aead.AESGCM(key)
+    ct = aesgcm.encrypt(iv, plaintext, None)
+    return {"iv": iv.hex(), "ct": ct.hex()}
+
+def aes_gcm_decrypt(key: bytes, enc: Dict[str, str]) -> bytes:
+    iv = bytes.fromhex(enc["iv"])
+    ct = bytes.fromhex(enc["ct"])
+    aesgcm = aead.AESGCM(key)
+    return aesgcm.decrypt(iv, ct, None)
 
 class Client:
     def __init__(self):
-        # 1. Generate RSA private and public key for Client
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=2048
-        )
-        self.public_key = private_key.public_key()
-
-        self.public_pem = public_key.public_bytes(
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.public_key = self.private_key.public_key()
+        self.public_pem = self.public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
+        self.ca_cert = load_ca_cert()
 
-    def _send_msg_from_model(self, msg: BaseModel):
-        self.connection.sendall(json.dumps(msg.dict()).encode())
-
-    def _receive_msg_from_model(self, size: int = 4096) -> dict[str, Any]:
-        received_data = self.connection.recv(size)
-        server_data = json.loads(received_data.decode())
-        return server_data
-
-    def _get_certificate(self):
-        public_pem_str = public_pem.decode("utf-8")
-        request: dict[str, Any] = {
-            "public_key": public_pem_str,
+    def get_cert_from_ca(self) -> bytes:
+        req = {
+            "public_key": self.public_pem.decode(),
             "common_name": "Alice",
             "email": "alice@example.com",
             "is_server": False,
         }
-        # Get certificate info from CA
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((CA_HOST, CA_PORT))
-            s.sendall(json.dumps(request).encode())
-            my_cert = s.recv(8192)
-        return my_cert
+            s.sendall(json.dumps(req).encode())
+            cert_pem = s.recv(8192)
+        return cert_pem
 
-    def _get_nonce(self):
-        return os.urandom(16)
+    def start(self):
+        # get my cert
+        my_cert = self.get_cert_from_ca()
+        # connect server
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((HOST, PORT))
 
-    def __isvalid_certificate(self, server_hello: HelloMessage):
-        if not verify_server_certificate(server_hello.cert.encode()):
-            print("Server certificate verification failed. Terminating connection.")
-            connection.close()
-            exit(1)
-        return True
+        # send hello: cert + nonce
+        nonce = secrets.token_bytes(16)
+        hello = {"type":"hello", "cert": my_cert.decode(), "nonce": nonce.hex()}
+        send_msg(s, hello)
 
-    def _exchange_certificates(self) -> HelloMessage:
-        global cert
-        cert = self.get_certificate()
+        # receive server hello
+        server_hello = recv_msg(s)
+        server_cert_pem = server_hello["cert"].encode()
+        server_nonce = bytes.fromhex(server_hello["nonce"])
+        print("[Client] Received server hello. Verifying server certificate...")
 
-        client_hello = HelloMessage(
-            type="hello",
-            cert=cert.decode(),
-            nonce=self.get_nonce().hex(),  # type: ignore
-        )
-        self._send_msg_from_model(client_hello)
-        server_data = self._receive_msg_from_model(4096)
-        server_hello = HelloMessage(**server_data)
-        print(f"[RECEIVED] Server Hello: {server_hello}")
+        # verify server cert
+        server_cert_obj = x509.load_pem_x509_certificate(server_cert_pem)
+        try:
+            self.ca_cert.public_key().verify(
+                server_cert_obj.signature,
+                server_cert_obj.tbs_certificate_bytes,
+                __import__("cryptography").hazmat.primitives.asymmetric.padding.PKCS1v15(),
+                server_cert_obj.signature_hash_algorithm,
+            )
+            print("[Client] Server certificate verified.")
+        except Exception as e:
+            print("[Client] Server certificate verification failed:", e)
+            s.close()
+            return
 
-        self.__isvalid_certificate(server_data)
-        return server_hello
+        # Receive DH params from server
+        dh_msg = recv_msg(s)
+        if dh_msg.get("type") != "dh_params":
+            print("[Client] Expected dh_params")
+            s.close()
+            return
+        p = int(dh_msg["p"])
+        g = int(dh_msg["g"])
+        B = int(dh_msg["B"])
 
-    def _generate_p_and_g(self):
-        return os.urandom(16), os.urandom(16)
+        # build parameters and generate client's private/public
+        params = dh.DHParameterNumbers(p, g).parameters()
+        client_priv = params.generate_private_key()
+        A = client_priv.public_key().public_numbers().y
+        # send A
+        send_msg(s, {"type": "dh_pub", "A": str(A)})
 
-    def _generate_public_value(self, p: int, q: int, a: int):
-        return (q**a) % p
+        # compute shared key and derive AES key
+        server_pub_numbers = dh.DHPublicNumbers(B, dh.DHParameterNumbers(p, g))
+        server_pub_key = server_pub_numbers.public_key()
+        shared = client_priv.exchange(server_pub_key)
+        session_key = hashlib.sha256(shared).digest()
+        print("[Client] Session key established.")
 
-    def exchange_DH_key(self):
-        p, q = self._generate_p_and_g()
-        a = os.urandom()
-        p_key = _generate_public_value(p, q, a)
-        msg = DH_P_Q_Client(p, q, a)
-        self._send_msg_from_model(msg)
-        received_data = self._receive_msg_from_model(4096)
-
-
-    def boot_up(self):
-        global cert
-        cert = self._get_certificate()  # Get my certificat form CA
-        verify_server_certificate(cert)  # verify my own certficate
-
-        self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.connection.connect((HOST, PORT))
-
-        # ------------------ exchnage the certificate ---------------- #
-        server_hello: HelloMessage = self._exchange_certificates()
-        print(f"Server Nonce: {server_hello.nonce}")
-
-        # -------------------- START KEY EXCHANING PROCESS ------------- #
-        self.exchange_DH_key()
-        # ------------------- Run Client -------------------
-
-        print("Enter your choice:")
-        print("1. Register\n2. Login\n")
-        choice = int(input("Choice: "))
-
-        if choice == 1:
-            print("Register selected.")
-            # Implement registration logic here
-        elif choice == 2:
-            print("Login selected.")
-            # Implement login logic here
-        else:
-            print("Invalid choice.")
-
-    # def start_client():
-    #     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    #     client.connect((HOST, PORT))
-    #     print(f"Connected to server at {HOST}:{PORT}")
-
-    #     try:
-    #         while True:
-    #             msg = input("Enter message: ")
-    #             if msg.lower() == "exit":
-    #                 break
-    #             client.send(msg.encode())
-    #             response = client.recv(1024).decode()
-    #             print(f"[Server] {response}")
-    #     finally:
-    #         client.close()
-    #         print("Disconnected from server.")
-
+        # interaction loop: register/login
+        while True:
+            print("\n1) Register\n2) Login\n3) Quit")
+            choice = input("Choice: ").strip()
+            if choice == "1":
+                username = input("username: ").strip()
+                password = input("password: ").strip()
+                pw_hash = hashlib.sha256(password.encode()).hexdigest()
+                payload = {"type":"register", "username": username, "password_hash": pw_hash}
+                enc = aes_gcm_encrypt(session_key, json.dumps(payload).encode())
+                send_msg(s, {"type":"secure", "payload": enc})
+                resp = recv_msg(s)
+                if resp and resp.get("type") == "secure":
+                    dec = aes_gcm_decrypt(session_key, resp["payload"])
+                    print("[Server]", json.loads(dec.decode()))
+            elif choice == "2":
+                username = input("username: ").strip()
+                password = input("password: ").strip()
+                pw_hash = hashlib.sha256(password.encode()).hexdigest()
+                payload = {"type":"login", "username": username, "password_hash": pw_hash}
+                enc = aes_gcm_encrypt(session_key, json.dumps(payload).encode())
+                send_msg(s, {"type":"secure", "payload": enc})
+                resp = recv_msg(s)
+                if resp and resp.get("type") == "secure":
+                    dec = aes_gcm_decrypt(session_key, resp["payload"])
+                    print("[Server]", json.loads(dec.decode()))
+            elif choice == "3":
+                print("Bye.")
+                break
+            else:
+                print("Invalid option.")
+        s.close()
 
 if __name__ == "__main__":
+    if not os.path.exists("rootCA.crt"):
+        print("rootCA.crt not found. Start ca.py first.")
+        exit(1)
     client = Client()
-    client.boot_up()
+    client.start()
