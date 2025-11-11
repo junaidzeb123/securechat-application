@@ -5,20 +5,25 @@ import os
 import secrets
 import hashlib
 from typing import Any, Dict
+from common.protocol import HelloMessage
 from cryptography.hazmat.primitives.asymmetric import rsa, dh
-from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers import aead
 from cryptography import x509
 
 HOST = "127.0.0.1"
 PORT = 9000
-CA_HOST = "127.0.0.1"
-CA_PORT = 8000
+CLIENT_PRIVATE_KEY = "../certs/client_private_key.pem"
+CLIENT_PUBLIC_KEY = "../certs/client_public_key.pem"
+CLIENT_CERT = "../certs/client.crt"
+CA_CERT = "../certs/rootCA.crt"
+
 
 def send_msg(sock: socket.socket, obj: Any):
     data = json.dumps(obj).encode()
     length = len(data).to_bytes(4, "big")
     sock.sendall(length + data)
+
 
 def recv_msg(sock: socket.socket) -> Any:
     raw_len = sock.recv(4)
@@ -33,9 +38,6 @@ def recv_msg(sock: socket.socket) -> Any:
         chunks += chunk
     return json.loads(chunks.decode())
 
-def load_ca_cert() -> x509.Certificate:
-    with open("rootCA.crt", "rb") as f:
-        return x509.load_pem_x509_certificate(f.read())
 
 def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool:
     cert = x509.load_pem_x509_certificate(cert_pem)
@@ -43,7 +45,11 @@ def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool
         ca_cert.public_key().verify(
             cert.signature,
             cert.tbs_certificate_bytes,
-            serialization.pkcs1v15 if False else __import__("cryptography").hazmat.primitives.asymmetric.padding.PKCS1v15(),
+            serialization.pkcs1v15
+            if False
+            else __import__(
+                "cryptography"
+            ).hazmat.primitives.asymmetric.padding.PKCS1v15(),
             cert.signature_hash_algorithm,
         )
         return True
@@ -54,7 +60,9 @@ def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool
                 cert.signature,
                 cert.tbs_certificate_bytes,
                 # Use padding PKCS1v15 directly:
-                __import__("cryptography").hazmat.primitives.asymmetric.padding.PKCS1v15(),
+                __import__(
+                    "cryptography"
+                ).hazmat.primitives.asymmetric.padding.PKCS1v15(),
                 cert.signature_hash_algorithm,
             )
             return True
@@ -62,11 +70,13 @@ def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool
             print("[Client] Certificate verification error:", e)
             return False
 
+
 def aes_gcm_encrypt(key: bytes, plaintext: bytes) -> Dict[str, str]:
     iv = secrets.token_bytes(12)
     aesgcm = aead.AESGCM(key)
     ct = aesgcm.encrypt(iv, plaintext, None)
     return {"iv": iv.hex(), "ct": ct.hex()}
+
 
 def aes_gcm_decrypt(key: bytes, enc: Dict[str, str]) -> bytes:
     iv = bytes.fromhex(enc["iv"])
@@ -74,39 +84,40 @@ def aes_gcm_decrypt(key: bytes, enc: Dict[str, str]) -> bytes:
     aesgcm = aead.AESGCM(key)
     return aesgcm.decrypt(iv, ct, None)
 
+
 class Client:
     def __init__(self):
-        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        self.public_key = self.private_key.public_key()
-        self.public_pem = self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        self.ca_cert = load_ca_cert()
+        self._load_keys_and_certificate()
 
-    def get_cert_from_ca(self) -> bytes:
-        req = {
-            "public_key": self.public_pem.decode(),
-            "common_name": "Alice",
-            "email": "alice@example.com",
-            "is_server": False,
-        }
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((CA_HOST, CA_PORT))
-            s.sendall(json.dumps(req).encode())
-            cert_pem = s.recv(8192)
-        return cert_pem
+    def _load_keys_and_certificate(self):
+        # Load CA private key
+        with open(CLIENT_PRIVATE_KEY, "rb") as f:
+            self.private_key = serialization.load_pem_private_key(
+                f.read(), password=None
+            )
+
+        with open(CLIENT_PUBLIC_KEY, "rb") as f:
+            self.public_key = serialization.load_pem_public_key(f.read())
+
+        # Load CA certificate
+        with open(CLIENT_CERT, "rb") as f:
+            self.client_cert = x509.load_pem_x509_certificate(f.read())
+
+        with open(CA_CERT, "wb"):
+            self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
     def start(self):
-        # get my cert
-        my_cert = self.get_cert_from_ca()
         # connect server
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect((HOST, PORT))
 
         # send hello: cert + nonce
         nonce = secrets.token_bytes(16)
-        hello = {"type":"hello", "cert": my_cert.decode(), "nonce": nonce.hex()}
+        hello = {
+            "type": "hello",
+            "cert": self.client_cert.decode(),
+            "nonce": nonce.hex(),
+        }
         send_msg(s, hello)
 
         # receive server hello
@@ -121,7 +132,9 @@ class Client:
             self.ca_cert.public_key().verify(
                 server_cert_obj.signature,
                 server_cert_obj.tbs_certificate_bytes,
-                __import__("cryptography").hazmat.primitives.asymmetric.padding.PKCS1v15(),
+                __import__(
+                    "cryptography"
+                ).hazmat.primitives.asymmetric.padding.PKCS1v15(),
                 server_cert_obj.signature_hash_algorithm,
             )
             print("[Client] Server certificate verified.")
@@ -162,9 +175,13 @@ class Client:
                 username = input("username: ").strip()
                 password = input("password: ").strip()
                 pw_hash = hashlib.sha256(password.encode()).hexdigest()
-                payload = {"type":"register", "username": username, "password_hash": pw_hash}
+                payload = {
+                    "type": "register",
+                    "username": username,
+                    "password_hash": pw_hash,
+                }
                 enc = aes_gcm_encrypt(session_key, json.dumps(payload).encode())
-                send_msg(s, {"type":"secure", "payload": enc})
+                send_msg(s, {"type": "secure", "payload": enc})
                 resp = recv_msg(s)
                 if resp and resp.get("type") == "secure":
                     dec = aes_gcm_decrypt(session_key, resp["payload"])
@@ -173,9 +190,13 @@ class Client:
                 username = input("username: ").strip()
                 password = input("password: ").strip()
                 pw_hash = hashlib.sha256(password.encode()).hexdigest()
-                payload = {"type":"login", "username": username, "password_hash": pw_hash}
+                payload = {
+                    "type": "login",
+                    "username": username,
+                    "password_hash": pw_hash,
+                }
                 enc = aes_gcm_encrypt(session_key, json.dumps(payload).encode())
-                send_msg(s, {"type":"secure", "payload": enc})
+                send_msg(s, {"type": "secure", "payload": enc})
                 resp = recv_msg(s)
                 if resp and resp.get("type") == "secure":
                     dec = aes_gcm_decrypt(session_key, resp["payload"])
@@ -187,8 +208,9 @@ class Client:
                 print("Invalid option.")
         s.close()
 
+
 if __name__ == "__main__":
-    if not os.path.exists("rootCA.crt"):
+    if not os.path.exists(CA_CERT):
         print("rootCA.crt not found. Start ca.py first.")
         exit(1)
     client = Client()

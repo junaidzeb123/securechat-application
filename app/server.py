@@ -5,19 +5,27 @@ import json
 import os
 import secrets
 import hashlib
-from typing import Dict, Any
-from cryptography.hazmat.primitives.asymmetric import rsa, padding, dh
+from typing import Any
+from cryptography.hazmat.primitives.asymmetric import  padding, dh
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.ciphers import aead
 from cryptography import x509
+
+from app.crypto.aes import aes_encrypt, aes_decrypt, generate_aes_key
+from app.crypto.dh import (
+    dh_generate_parameters,
+    dh_generate_private_key,
+    dh_derive_shared_key,
+)
+
 
 HOST = "127.0.0.1"
 PORT = 9000
 CA_HOST = "127.0.0.1"
 CA_PORT = 8000
-
-# Simple in-memory user store: username -> password_hash
-USER_DB: Dict[str, str] = {}
+SERVER_PRIVATE_KEY = "../certs/server_private_key.pem"
+SERVER_PUBLIC_KEY = "../certs/server_public_key.pem"
+SERVER_CERT = "../certs/server.crt"
+CA_CERT = "../certs/rootCA.crt"
 
 
 # Helpers: length-prefixed JSON messages
@@ -41,13 +49,6 @@ def recv_msg(sock: socket.socket) -> Any:
     return json.loads(chunks.decode())
 
 
-# Load CA cert (written by ca.py)
-def load_ca_cert() -> x509.Certificate:
-    with open("rootCA.crt", "rb") as f:
-        data = f.read()
-    return x509.load_pem_x509_certificate(data)
-
-
 def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool:
     cert = x509.load_pem_x509_certificate(cert_pem)
     ca_pub = ca_cert.public_key()
@@ -64,48 +65,26 @@ def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool
         return False
 
 
-def aes_gcm_encrypt(key: bytes, plaintext: bytes) -> Dict[str, str]:
-    # 12-byte nonce
-    iv = secrets.token_bytes(12)
-    aesgcm = aead.AESGCM(key)
-    ct = aesgcm.encrypt(iv, plaintext, None)
-    # AESGCM returns ciphertext || tag; we only need to send iv + ct as hex
-    return {"iv": iv.hex(), "ct": ct.hex()}
-
-
-def aes_gcm_decrypt(key: bytes, enc: Dict[str, str]) -> bytes:
-    iv = bytes.fromhex(enc["iv"])
-    ct = bytes.fromhex(enc["ct"])
-    aesgcm = aead.AESGCM(key)
-    pt = aesgcm.decrypt(iv, ct, None)
-    return pt
-
-
 class Server:
     def __init__(self):
-        # RSA keypair for server identity
-        self.private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=2048
-        )
-        self.public_key = self.private_key.public_key()
-        self.public_pem = self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        self.ca_cert = load_ca_cert()
+        self._load_keys_and_certificate()
 
-    def get_cert_from_ca(self) -> bytes:
-        req = {
-            "public_key": self.public_pem.decode(),
-            "common_name": "TestServer",
-            "email": "server@example.com",
-            "is_server": True,
-        }
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((CA_HOST, CA_PORT))
-            s.sendall(json.dumps(req).encode())
-            cert_pem = s.recv(8192)
-        return cert_pem
+    def _load_keys_and_certificate(self):
+        # Load CA private key
+        with open(SERVER_PRIVATE_KEY, "rb") as f:
+            self.private_key = serialization.load_pem_private_key(
+                f.read(), password=None
+            )
+
+        with open(SERVER_PUBLIC_KEY, "rb") as f:
+            self.public_key = serialization.load_pem_public_key(f.read())
+
+        # Load CA certificate
+        with open(SERVER_CERT, "rb") as f:
+            self.client_cert = x509.load_pem_x509_certificate(f.read())
+
+        with open(CA_CERT, "wb"):
+            self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
     def handle_client(self, conn: socket.socket, addr):
         print(f"[Server] Connection from {addr}")
@@ -255,7 +234,7 @@ class Server:
 
 if __name__ == "__main__":
     # Ensure CA cert exists
-    if not os.path.exists("rootCA.crt"):
+    if not os.path.exists(CA_CERT):
         print("rootCA.crt not found. Start ca.py first.")
         exit(1)
     server = Server()
