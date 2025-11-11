@@ -55,7 +55,7 @@ cert_pem = root_cert.public_bytes(serialization.Encoding.PEM)
 with open(f"{CERTS_ROOT_PATH}/rootCA.key", "wb") as f:
     f.write(private_pem)
 
-with open(f"{CERTS_ROOT_PATH}rootCA.crt", "wb") as f:
+with open(f"{CERTS_ROOT_PATH}/rootCA.crt", "wb") as f:
     f.write(cert_pem)
 
 print("Root CA private key and certificate generated successfully!")
