@@ -1,7 +1,6 @@
 import socket
 import threading
 import json
-import os
 import secrets
 import base64
 import hashlib
@@ -12,7 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, dh
 from cryptography.hazmat.primitives import serialization, hashes
 from crypto.aes import aes_encrypt, aes_decrypt
 from crypto.dh import dh_generate_private_key, dh_derive_shared_key
-from common.protocol import HelloMessage, DH_P_Q_Client, DH_Server_B
+from common.protocol import DH_P_Q_Client
 
 HOST = "127.0.0.1"
 PORT = 9000
@@ -73,7 +72,9 @@ class Server:
         priv = dh_generate_private_key(parameters)
         pub = priv.public_key()
         send_msg(conn, {"type": "dh_server", "B": str(pub.public_numbers().y)})
-        client_pub = dh.DHPublicNumbers(int(client_dh.A), dh.DHParameterNumbers(p, g)).public_key()
+        client_pub = dh.DHPublicNumbers(
+            int(client_dh.A), dh.DHParameterNumbers(p, g)
+        ).public_key()
         session_key = dh_derive_shared_key(priv, client_pub)[:16]  # AES-128
         return session_key
 
@@ -84,7 +85,14 @@ class Server:
             verify_cert_signed_by_ca(client_cert_pem, self.ca_cert)
 
             server_nonce = secrets.token_bytes(16)
-            send_msg(conn, {"type": "server_hello", "cert": self.cert_pem.decode(), "nonce": server_nonce.hex()})
+            send_msg(
+                conn,
+                {
+                    "type": "server_hello",
+                    "cert": self.cert_pem.decode(),
+                    "nonce": server_nonce.hex(),
+                },
+            )
 
             session_key = self.perform_dh_key_exchange(conn)
             print(f"[+] Session key ({addr}):", session_key.hex())
@@ -120,7 +128,12 @@ class Server:
                         reply = {"status": "error", "msg": "invalid credentials"}
                 elif payload["type"] == "chat":
                     print(f"[Chat from {addr}]: {payload['msg']}")
-                    reply = {"status": "ok", "msg": "Message received"}
+                    # Server operator replies interactively
+                    reply_msg = input(f"Reply to {addr}: ").strip()
+                    reply = {"status": "ok", "msg": reply_msg}
+                    if reply_msg.lower() == "quit":
+                        print(f"[Server] Ending chat with {addr}")
+                        break
                 else:
                     reply = {"status": "error", "msg": "unknown request"}
 
