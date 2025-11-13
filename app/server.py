@@ -1,250 +1,155 @@
-# server.py
 import socket
 import threading
 import json
 import os
 import secrets
-from typing import Any
-from cryptography.hazmat.primitives.asymmetric import padding, dh
-from cryptography.hazmat.primitives import serialization
-from cryptography import x509
-from common.protocol import HelloMessage, DH_Server_B, DH_P_Q_Client
-import hashlib
-from crypto.aes import aes_encrypt, aes_decrypt, generate_aes_key
-from crypto.dh import (
-    dh_generate_parameters,
-    dh_generate_private_key,
-    dh_derive_shared_key,
-)
 import base64
+import hashlib
+import time
+from typing import Any
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import padding, dh
+from cryptography.hazmat.primitives import serialization, hashes
+from crypto.aes import aes_encrypt, aes_decrypt
+from crypto.dh import dh_generate_private_key, dh_derive_shared_key
+from common.protocol import HelloMessage, DH_P_Q_Client, DH_Server_B
 
 HOST = "127.0.0.1"
 PORT = 9000
-CA_HOST = "127.0.0.1"
-CA_PORT = 8000
 SERVER_PRIVATE_KEY = "../certs/server_private_key.pem"
-SERVER_PUBLIC_KEY = "../certs/server_public_key.pem"
 SERVER_CERT = "../certs/server_cert.crt"
 CA_CERT = "../certs/rootCA.crt"
 
+USER_DB = {}  # {username: password_hash}
 
-# Helpers: length-prefixed JSON messages
+
 def send_msg(sock: socket.socket, obj: Any):
-    data = json.dumps(obj.__dict__).encode()
-    length = len(data).to_bytes(4, "big")
-    print(data)
-    sock.sendall(length + data)
+    data = json.dumps(obj).encode()
+    sock.sendall(len(data).to_bytes(4, "big") + data)
 
 
-def recv_msg(sock: socket.socket) -> Any:
+def recv_msg(sock: socket.socket):
     raw_len = sock.recv(4)
     if not raw_len:
         return None
     length = int.from_bytes(raw_len, "big")
-    chunks = b""
-    while len(chunks) < length:
-        chunk = sock.recv(length - len(chunks))
+    data = b""
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
         if not chunk:
-            raise ConnectionError("Socket closed")
-        chunks += chunk
-    return json.loads(chunks.decode())
+            return None
+        data += chunk
+    return json.loads(data.decode())
 
 
 def verify_cert_signed_by_ca(cert_pem: bytes, ca_cert: x509.Certificate) -> bool:
     cert = x509.load_pem_x509_certificate(cert_pem)
     ca_pub = ca_cert.public_key()
-    try:
-        ca_pub.verify(
-            cert.signature,
-            cert.tbs_certificate_bytes,
-            padding.PKCS1v15(),
-            cert.signature_hash_algorithm,
-        )
-        return True
-    except Exception as e:
-        print("[Server] Certificate verification failed:", e)
-        return False
+    ca_pub.verify(
+        cert.signature,
+        cert.tbs_certificate_bytes,
+        padding.PKCS1v15(),
+        cert.signature_hash_algorithm,
+    )
+    return True
 
 
 class Server:
     def __init__(self):
-        self._load_keys_and_certificate()
+        self._load_keys()
 
-    def _load_keys_and_certificate(self):
-        # Load CA private key
+    def _load_keys(self):
         with open(SERVER_PRIVATE_KEY, "rb") as f:
-            self.private_key = serialization.load_pem_private_key(
-                f.read(), password=None
-            )
-
-        with open(SERVER_PUBLIC_KEY, "rb") as f:
-            self.public_key = serialization.load_pem_public_key(f.read())
-
-        # Load CA certificate
+            self.private_key = serialization.load_pem_private_key(f.read(), None)
         with open(SERVER_CERT, "rb") as f:
-            self.server_cert = f.read()
-
+            self.cert_pem = f.read()
         with open(CA_CERT, "rb") as f:
             self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
-    def perform_dh_key_exchange_server(self, conn):
-        """Perform Diffie–Hellman key exchange as server."""
-        # Receive DH parameters and client's public value
+    def perform_dh_key_exchange(self, conn):
         client_dh = DH_P_Q_Client(**recv_msg(conn))
-        if client_dh.type != "dh_client":
-            print("[Server] Expected dh_client")
-            return None
-
-        p = int(client_dh.p)
-        g = int(client_dh.g)
-
-        # Create parameters from client's (p, g)
+        p, g = int(client_dh.p), int(client_dh.g)
         parameters = dh.DHParameterNumbers(p, g).parameters()
-
-        # Generate server's DH key pair
-        server_priv = dh_generate_private_key(parameters)
-        server_pub = server_priv.public_key()
-        server_pub_num = server_pub.public_numbers().y
-
-        # Send server's public key back
-        dh_msg = DH_Server_B(type="dh_server", B=str(server_pub_num))
-        send_msg(conn, dh_msg)
-
-        # Reconstruct client's public key from A
-        client_pub_numbers = dh.DHPublicNumbers(
-            int(client_dh.A), dh.DHParameterNumbers(p, g)
-        )
-        client_pub_key = client_pub_numbers.public_key()
-
-        # Derive shared session key
-        session_key = dh_derive_shared_key(server_priv, client_pub_key)
-
-        print("[Server] Session key established:", session_key.hex())
+        priv = dh_generate_private_key(parameters)
+        pub = priv.public_key()
+        send_msg(conn, {"type": "dh_server", "B": str(pub.public_numbers().y)})
+        client_pub = dh.DHPublicNumbers(int(client_dh.A), dh.DHParameterNumbers(p, g)).public_key()
+        session_key = dh_derive_shared_key(priv, client_pub)[:16]  # AES-128
         return session_key
 
-    def handle_client(self, conn: socket.socket, addr):
-        print(f"[Server] Connection from {addr}")
+    def handle_client(self, conn, addr):
         try:
-            # Step 2: receive client hello (client cert + nonce)
-            client_hello = recv_msg(conn)
-            if client_hello is None:
-                return
-            client_cert_pem = client_hello["cert"].encode()
-            client_nonce = bytes.fromhex(client_hello["nonce"])
-            print("[Server] Received client hello, nonce:", client_hello["nonce"][:16])
+            hello = recv_msg(conn)
+            client_cert_pem = hello["cert"].encode()
+            verify_cert_signed_by_ca(client_cert_pem, self.ca_cert)
 
-            # verify client certificate against CA
-            if not verify_cert_signed_by_ca(client_cert_pem, self.ca_cert):
-                print("[Server] Client cert verification failed. Closing.")
-                conn.close()
-                return
-
-            # Step 3: send server hello with nonce
             server_nonce = secrets.token_bytes(16)
-            server_hello = HelloMessage(
-                type="server_hello",
-                cert=self.server_cert.decode(),
-                nonce=server_nonce.hex(),
-            )
+            send_msg(conn, {"type": "server_hello", "cert": self.cert_pem.decode(), "nonce": server_nonce.hex()})
 
-            send_msg(conn, server_hello)
-            session_key = self.perform_dh_key_exchange_server(conn)
-            print("[Server] Session key established.", session_key.hex())
+            session_key = self.perform_dh_key_exchange(conn)
+            print(f"[+] Session key ({addr}):", session_key.hex())
 
-            # Now loop to decrypt incoming secure messages
+            seqno_expected = 1
+
             while True:
                 msg = recv_msg(conn)
-                if msg is None:
+                if not msg:
                     break
-                try:
-                    print("msg", msg)
-                    cipher_bytes = base64.b64decode(msg["payload"])
-                    print("cipher_bytes", cipher_bytes)
-                    plaintext = aes_decrypt(session_key, cipher_bytes)
 
-                    print("[Server] Received secure message.", plaintext)
-                    payload = json.loads(plaintext.decode())
-                    print("Login payload", payload)
-                    typ = msg.get("type")
-                    if typ == "login":
-                        print("[Server] Processing login message", payload)
-                        print("[Server] Expected login message")
+                ct = base64.b64decode(msg["ct"])
+                sig = base64.b64decode(msg["sig"])
+                seqno, ts = msg["seqno"], msg["ts"]
 
-                    if typ == "register":
-                        username = payload["username"]
-                        pw_hash = payload["password_hash"]
-                        if username in USER_DB:
-                            res = {"status": "error", "message": "user exists"}
-                        else:
-                            USER_DB[username] = pw_hash
-                            res = {"status": "ok", "message": "registered"}
-                        send_msg(
-                            conn,
-                            {
-                                "type": "secure",
-                                "payload": aes_gcm_encrypt(
-                                    session_key, json.dumps(res).encode()
-                                ),
-                            },
-                        )
-                    elif typ == "login":
-                        username = payload["username"]
-                        pw_hash = payload["password_hash"]
-                        stored = USER_DB.get(username)
-                        if stored is None or stored != pw_hash:
-                            res = {"status": "error", "message": "invalid credentials"}
-                        else:
-                            res = {"status": "ok", "message": "login successful"}
-                        send_msg(
-                            conn,
-                            {
-                                "type": "secure",
-                                "payload": aes_gcm_encrypt(
-                                    session_key, json.dumps(res).encode()
-                                ),
-                            },
-                        )
+                digest = hashlib.sha256(f"{seqno}{ts}".encode() + ct).digest()
+                client_cert = x509.load_pem_x509_certificate(client_cert_pem)
+                client_pub = client_cert.public_key()
+
+                client_pub.verify(sig, digest, padding.PKCS1v15(), hashes.SHA256())
+
+                plaintext = aes_decrypt(session_key, ct).decode()
+                payload = json.loads(plaintext)
+                print(f"[{addr}] Received:", payload)
+
+                if payload["type"] == "register":
+                    USER_DB[payload["username"]] = payload["password_hash"]
+                    reply = {"status": "ok", "msg": "registered"}
+                elif payload["type"] == "login":
+                    if USER_DB.get(payload["username"]) == payload["password_hash"]:
+                        reply = {"status": "ok", "msg": "login successful"}
                     else:
-                        res = {"status": "error", "message": "unknown request"}
-                        send_msg(
-                            conn,
-                            {
-                                "type": "secure",
-                                "payload": aes_gcm_encrypt(
-                                    session_key, json.dumps(res).encode()
-                                ),
-                            },
-                        )
-                except Exception as e:
-                    print("[Server] Decrypt/process error:", e)
-                    break
-                # """
-        except ConnectionError:
-            print("[Server] Connection closed by client.")
+                        reply = {"status": "error", "msg": "invalid credentials"}
+                else:
+                    reply = {"status": "error", "msg": "unknown request"}
+
+                # Server reply with same secure message format
+                ct = aes_encrypt(session_key, json.dumps(reply).encode())
+                ts = int(time.time() * 1000)
+                seqno_expected += 1
+                digest = hashlib.sha256(f"{seqno_expected}{ts}".encode() + ct).digest()
+                sig = self.private_key.sign(digest, padding.PKCS1v15(), hashes.SHA256())
+                resp = {
+                    "type": "msg",
+                    "seqno": seqno_expected,
+                    "ts": ts,
+                    "ct": base64.b64encode(ct).decode(),
+                    "sig": base64.b64encode(sig).decode(),
+                }
+                send_msg(conn, resp)
+
+        except Exception as e:
+            print("[!] Error:", e)
         finally:
             conn.close()
-            print(f"[Server] Disconnected {addr}")
 
     def start(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = socket.socket()
         s.bind((HOST, PORT))
         s.listen()
         print(f"[Server] Listening on {HOST}:{PORT}")
-        try:
-            while True:
-                conn, addr = s.accept()
-                t = threading.Thread(target=self.handle_client, args=(conn, addr))
-                t.start()
-        except KeyboardInterrupt:
-            print("[Server] Stopping.")
-        finally:
-            s.close()
+        while True:
+            conn, addr = s.accept()
+            threading.Thread(target=self.handle_client, args=(conn, addr)).start()
 
 
 if __name__ == "__main__":
-    # Ensure CA cert exists
-    if not os.path.exists(CA_CERT):
-        print("rootCA.crt not found. Start ca.py first.")
-        exit(1)
-    server = Server()
-    server.start()
+    Server().start()
