@@ -4,13 +4,22 @@ import json
 import os
 import secrets
 from typing import Any, Dict
-from common.protocol import HelloMessage, DH_P_Q_Client, DH_Server_B
+import base64
+from common.protocol import (
+    HelloMessage,
+    DH_P_Q_Client,
+    DH_Server_B,
+    LoginMessage,
+    RegisterMessage,
+    SecureMessage,
+)
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers import aead
 from cryptography import x509
 import hashlib
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
+from crypto.aes import aes_encrypt, aes_decrypt
 
 HOST = "127.0.0.1"
 PORT = 9000
@@ -171,44 +180,42 @@ class Client:
         print("[Client] Session key established.", session_key.hex())
 
         # interaction loop: register/login
+        print("\n1) Register\n2) Login\n3) Quit")
+        choice = input("Choice: ").strip()
+        if choice == "1":
+            username = input("username: ").strip()
+            password = input("password: ").strip()
+            pw_hash = hashlib.sha256(password.encode()).hexdigest()
+            payload = {
+                "type": "register",
+                "username": username,
+                "password": password,
+                "password_hash": pw_hash,
+            }
+            register_msg = RegisterMessage(payload=payload)
+            enc = aes_encrypt(session_key, json.dumps(register_msg.__dict__).encode())
+            enc_b64 = base64.b64encode(enc).decode()  # bytes → base64 string
+            enc_msg = SecureMessage(payload=enc_b64)
+            print("[Client] Sending register message:", enc)
+            send_msg(s, enc_msg)
+        elif choice == "2":
+            username = input("username: ").strip()
+            password = input("password: ").strip()
+            pw_hash = hashlib.sha256(password.encode()).hexdigest()
+            payload = {
+                "type": "login",
+                "username": username,
+                "password": password,
+                "password_hash": pw_hash,
+            }
+            register_msg = LoginMessage(payload=payload)
+            enc = aes_encrypt(session_key, json.dumps(register_msg.__dict__).encode())
+            enc_b64 = base64.b64encode(enc).decode()  # bytes → base64 string
+            enc_msg = SecureMessage(payload=enc_b64)
+            print("[Client] Sending register message:", enc)
+            send_msg(s, enc_msg)
         while True:
-            print("\n1) Register\n2) Login\n3) Quit")
-            choice = input("Choice: ").strip()
-            if choice == "1":
-                username = input("username: ").strip()
-                password = input("password: ").strip()
-                pw_hash = hashlib.sha256(password.encode()).hexdigest()
-                payload = {
-                    "type": "register",
-                    "username": username,
-                    "password_hash": pw_hash,
-                }
-                enc = aes_gcm_encrypt(session_key, json.dumps(payload).encode())
-                send_msg(s, {"type": "secure", "payload": enc})
-                resp = recv_msg(s)
-                if resp and resp.get("type") == "secure":
-                    dec = aes_gcm_decrypt(session_key, resp["payload"])
-                    print("[Server]", json.loads(dec.decode()))
-            elif choice == "2":
-                username = input("username: ").strip()
-                password = input("password: ").strip()
-                pw_hash = hashlib.sha256(password.encode()).hexdigest()
-                payload = {
-                    "type": "login",
-                    "username": username,
-                    "password_hash": pw_hash,
-                }
-                enc = aes_gcm_encrypt(session_key, json.dumps(payload).encode())
-                send_msg(s, {"type": "secure", "payload": enc})
-                resp = recv_msg(s)
-                if resp and resp.get("type") == "secure":
-                    dec = aes_gcm_decrypt(session_key, resp["payload"])
-                    print("[Server]", json.loads(dec.decode()))
-            elif choice == "3":
-                print("Bye.")
-                break
-            else:
-                print("Invalid option.")
+            pass
         s.close()
 
 

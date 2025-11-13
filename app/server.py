@@ -11,7 +11,7 @@ from cryptography import x509
 from common.protocol import HelloMessage, DH_Server_B, DH_P_Q_Client
 import hashlib
 from crypto.aes import aes_encrypt, aes_decrypt, generate_aes_key
-
+import base64
 
 HOST = "127.0.0.1"
 PORT = 9000
@@ -110,14 +110,6 @@ class Server:
             send_msg(conn, server_hello)
 
             # At this point both sides could sign each other's nonce to prove private key possession.
-            # For simplicity we skip explicit signing step and proceed to ephemeral DH.
-
-            # Step 4: Diffie-Hellman key exchange
-            # Server generates parameters and its private key
-            # """
-
-            # receive client's A
-            # Receive client's DH parameters
             client_dh = DH_P_Q_Client(**recv_msg(conn))
             if client_dh.type != "dh_client":
                 print("[Server] Expected dh_client")
@@ -151,13 +143,20 @@ class Server:
                 msg = recv_msg(conn)
                 if msg is None:
                     break
-                if msg.get("type") != "secure":
-                    continue
-                enc = msg["payload"]
                 try:
-                    plaintext = aes_gcm_decrypt(session_key, enc)
+                    print("msg", msg)
+                    cipher_bytes = base64.b64decode(msg["payload"])
+                    print("cipher_bytes", cipher_bytes)
+                    plaintext = aes_decrypt(session_key, cipher_bytes)
+
+                    print("[Server] Received secure message.", plaintext)
                     payload = json.loads(plaintext.decode())
-                    typ = payload.get("type")
+                    print("Login payload", payload)
+                    typ = msg.get("type")
+                    if typ == "login":
+                        print("[Server] Processing login message", payload)
+                        print("[Server] Expected login message")
+
                     if typ == "register":
                         username = payload["username"]
                         pw_hash = payload["password_hash"]

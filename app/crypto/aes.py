@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 import os
 
+
 def generate_aes_key() -> bytes:
     """Generate a random 16-byte AES key."""
     return os.urandom(16)
