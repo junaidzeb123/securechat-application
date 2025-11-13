@@ -19,7 +19,12 @@ from cryptography import x509
 import hashlib
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
-from crypto.aes import aes_encrypt, aes_decrypt
+from crypto.aes import aes_encrypt
+from crypto.dh import (
+    dh_generate_parameters,
+    dh_generate_private_key,
+    dh_derive_shared_key,
+)
 
 HOST = "127.0.0.1"
 PORT = 9000
@@ -116,6 +121,42 @@ class Client:
         with open(CA_CERT, "rb") as f:
             self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
+    def perform_dh_key_exchange_client(self, s):
+        """Perform Diffie–Hellman key exchange as client."""
+        # Generate DH parameters (p, g)
+        parameters = dh_generate_parameters(generator=5, key_size=512)
+
+        # Generate client key pair
+        client_priv = dh_generate_private_key(parameters)
+        client_pub = client_priv.public_key()
+
+        # Extract p, g, and A = g^a mod p
+        pn = parameters.parameter_numbers()
+        p, g = pn.p, pn.g
+        A = client_pub.public_numbers().y
+
+        # Send DH parameters and public key A to server
+        dh_msg = DH_P_Q_Client(type="dh_client", p=str(p), g=str(g), A=str(A))
+        send_msg(s, dh_msg)
+
+        # Receive server's public key B
+        dh_msg_server = DH_Server_B(**recv_msg(s))
+        if dh_msg_server.type != "dh_server":
+            print("[Client] Expected dh_server")
+            return None
+
+        # Reconstruct server's public key
+        server_pub_numbers = dh.DHPublicNumbers(
+            int(dh_msg_server.B), dh.DHParameterNumbers(p, g)
+        )
+        server_pub_key = server_pub_numbers.public_key()
+
+        # Derive shared session key
+        session_key = dh_derive_shared_key(client_priv, server_pub_key)
+
+        print("[Client] Session key established:", session_key.hex())
+        return session_key
+
     def start(self):
         # connect server
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -149,34 +190,8 @@ class Client:
             s.close()
             return
 
-        # Generate parameters (p, g)
-        parameters = dh.generate_parameters(generator=5, key_size=512)
-        client_priv = parameters.generate_private_key()
-        client_pub = client_priv.public_key()
-
-        pn = parameters.parameter_numbers()
-        p = pn.p
-        g = pn.g
-
-        client_pub_num = client_pub.public_numbers().y
-        dh_msg = DH_P_Q_Client(
-            type="dh_client", p=str(p), g=str(g), A=str(client_pub_num)
-        )
-        send_msg(s, dh_msg)
-
-        # Receive DH response from server
-        dh_msg_server = DH_Server_B(**recv_msg(s))
-        if dh_msg_server.type != "dh_server":
-            print("[Client] Expected dh_server")
-            return
-
-        # Compute shared secret
-        server_pub_numbers = dh.DHPublicNumbers(
-            int(dh_msg_server.B), dh.DHParameterNumbers(p, g)
-        )
-        server_pub_key = server_pub_numbers.public_key()
-        shared = client_priv.exchange(server_pub_key)
-        session_key = hashlib.sha256(shared).digest()
+        
+        session_key = self.perform_dh_key_exchange_client(s)
         print("[Client] Session key established.", session_key.hex())
 
         # interaction loop: register/login

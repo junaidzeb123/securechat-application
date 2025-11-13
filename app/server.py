@@ -11,6 +11,11 @@ from cryptography import x509
 from common.protocol import HelloMessage, DH_Server_B, DH_P_Q_Client
 import hashlib
 from crypto.aes import aes_encrypt, aes_decrypt, generate_aes_key
+from crypto.dh import (
+    dh_generate_parameters,
+    dh_generate_private_key,
+    dh_derive_shared_key,
+)
 import base64
 
 HOST = "127.0.0.1"
@@ -82,6 +87,41 @@ class Server:
         with open(CA_CERT, "rb") as f:
             self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
+    def perform_dh_key_exchange_server(self, conn):
+        """Perform Diffie–Hellman key exchange as server."""
+        # Receive DH parameters and client's public value
+        client_dh = DH_P_Q_Client(**recv_msg(conn))
+        if client_dh.type != "dh_client":
+            print("[Server] Expected dh_client")
+            return None
+
+        p = int(client_dh.p)
+        g = int(client_dh.g)
+
+        # Create parameters from client's (p, g)
+        parameters = dh.DHParameterNumbers(p, g).parameters()
+
+        # Generate server's DH key pair
+        server_priv = dh_generate_private_key(parameters)
+        server_pub = server_priv.public_key()
+        server_pub_num = server_pub.public_numbers().y
+
+        # Send server's public key back
+        dh_msg = DH_Server_B(type="dh_server", B=str(server_pub_num))
+        send_msg(conn, dh_msg)
+
+        # Reconstruct client's public key from A
+        client_pub_numbers = dh.DHPublicNumbers(
+            int(client_dh.A), dh.DHParameterNumbers(p, g)
+        )
+        client_pub_key = client_pub_numbers.public_key()
+
+        # Derive shared session key
+        session_key = dh_derive_shared_key(server_priv, client_pub_key)
+
+        print("[Server] Session key established:", session_key.hex())
+        return session_key
+
     def handle_client(self, conn: socket.socket, addr):
         print(f"[Server] Connection from {addr}")
         try:
@@ -108,34 +148,7 @@ class Server:
             )
 
             send_msg(conn, server_hello)
-
-            # At this point both sides could sign each other's nonce to prove private key possession.
-            client_dh = DH_P_Q_Client(**recv_msg(conn))
-            if client_dh.type != "dh_client":
-                print("[Server] Expected dh_client")
-                return
-
-            p = int(client_dh.p)
-            g = int(client_dh.g)
-
-            # Create parameters from client's p, g
-            parameters = dh.DHParameterNumbers(p, g).parameters()
-            server_priv = parameters.generate_private_key()
-            server_pub = server_priv.public_key()
-            server_pub_num = server_pub.public_numbers().y
-
-            # Send server's public key
-            dh_msg = DH_Server_B(type="dh_server", B=str(server_pub_num))
-            send_msg(conn, dh_msg)
-
-            # Compute shared secret
-            client_pub_numbers = dh.DHPublicNumbers(
-                int(client_dh.A), dh.DHParameterNumbers(p, g)
-            )
-            client_pub_key = client_pub_numbers.public_key()
-            shared_key = server_priv.exchange(client_pub_key)
-            session_key = hashlib.sha256(shared_key).digest()
-
+            session_key = self.perform_dh_key_exchange_server(conn)
             print("[Server] Session key established.", session_key.hex())
 
             # Now loop to decrypt incoming secure messages
