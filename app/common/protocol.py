@@ -11,9 +11,9 @@ class HelloMessage(BaseModel):
 
 class DH_P_Q_Client(BaseModel):
     type: str = "dh_client"
-    g: int
-    p: int
-    A: int
+    g: str
+    p: str
+    A: str
 
 
 class DH_Server_B(BaseModel):

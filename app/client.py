@@ -3,24 +3,25 @@ import socket
 import json
 import os
 import secrets
-import hashlib
 from typing import Any, Dict
-from common.protocol import HelloMessage
-from cryptography.hazmat.primitives.asymmetric import rsa, dh
+from common.protocol import HelloMessage, DH_P_Q_Client, DH_Server_B
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers import aead
 from cryptography import x509
+import hashlib
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 
 HOST = "127.0.0.1"
 PORT = 9000
 CLIENT_PRIVATE_KEY = "../certs/client_private_key.pem"
 CLIENT_PUBLIC_KEY = "../certs/client_public_key.pem"
-CLIENT_CERT = "../certs/client.crt"
+CLIENT_CERT = "../certs/client_cert.crt"
 CA_CERT = "../certs/rootCA.crt"
 
 
 def send_msg(sock: socket.socket, obj: Any):
-    data = json.dumps(obj).encode()
+    data = json.dumps(obj.__dict__).encode()
     length = len(data).to_bytes(4, "big")
     sock.sendall(length + data)
 
@@ -101,9 +102,9 @@ class Client:
 
         # Load CA certificate
         with open(CLIENT_CERT, "rb") as f:
-            self.client_cert = x509.load_pem_x509_certificate(f.read())
+            self.client_cert = f.read()  # raw PEM bytes
 
-        with open(CA_CERT, "wb"):
+        with open(CA_CERT, "rb") as f:
             self.ca_cert = x509.load_pem_x509_certificate(f.read())
 
     def start(self):
@@ -113,18 +114,16 @@ class Client:
 
         # send hello: cert + nonce
         nonce = secrets.token_bytes(16)
-        hello = {
-            "type": "hello",
-            "cert": self.client_cert.decode(),
-            "nonce": nonce.hex(),
-        }
+        hello = HelloMessage(
+            type="hello", cert=self.client_cert.decode(), nonce=nonce.hex()
+        )
+
         send_msg(s, hello)
 
         # receive server hello
         server_hello = recv_msg(s)
         server_cert_pem = server_hello["cert"].encode()
         server_nonce = bytes.fromhex(server_hello["nonce"])
-        print("[Client] Received server hello. Verifying server certificate...")
 
         # verify server cert
         server_cert_obj = x509.load_pem_x509_certificate(server_cert_pem)
@@ -132,9 +131,7 @@ class Client:
             self.ca_cert.public_key().verify(
                 server_cert_obj.signature,
                 server_cert_obj.tbs_certificate_bytes,
-                __import__(
-                    "cryptography"
-                ).hazmat.primitives.asymmetric.padding.PKCS1v15(),
+                PKCS1v15(),
                 server_cert_obj.signature_hash_algorithm,
             )
             print("[Client] Server certificate verified.")
@@ -143,29 +140,35 @@ class Client:
             s.close()
             return
 
-        # Receive DH params from server
-        dh_msg = recv_msg(s)
-        if dh_msg.get("type") != "dh_params":
-            print("[Client] Expected dh_params")
-            s.close()
+        # Generate parameters (p, g)
+        parameters = dh.generate_parameters(generator=5, key_size=512)
+        client_priv = parameters.generate_private_key()
+        client_pub = client_priv.public_key()
+
+        pn = parameters.parameter_numbers()
+        p = pn.p
+        g = pn.g
+
+        client_pub_num = client_pub.public_numbers().y
+        dh_msg = DH_P_Q_Client(
+            type="dh_client", p=str(p), g=str(g), A=str(client_pub_num)
+        )
+        send_msg(s, dh_msg)
+
+        # Receive DH response from server
+        dh_msg_server = DH_Server_B(**recv_msg(s))
+        if dh_msg_server.type != "dh_server":
+            print("[Client] Expected dh_server")
             return
-        p = int(dh_msg["p"])
-        g = int(dh_msg["g"])
-        B = int(dh_msg["B"])
 
-        # build parameters and generate client's private/public
-        params = dh.DHParameterNumbers(p, g).parameters()
-        client_priv = params.generate_private_key()
-        A = client_priv.public_key().public_numbers().y
-        # send A
-        send_msg(s, {"type": "dh_pub", "A": str(A)})
-
-        # compute shared key and derive AES key
-        server_pub_numbers = dh.DHPublicNumbers(B, dh.DHParameterNumbers(p, g))
+        # Compute shared secret
+        server_pub_numbers = dh.DHPublicNumbers(
+            int(dh_msg_server.B), dh.DHParameterNumbers(p, g)
+        )
         server_pub_key = server_pub_numbers.public_key()
         shared = client_priv.exchange(server_pub_key)
         session_key = hashlib.sha256(shared).digest()
-        print("[Client] Session key established.")
+        print("[Client] Session key established.", session_key.hex())
 
         # interaction loop: register/login
         while True:

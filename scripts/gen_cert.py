@@ -93,7 +93,11 @@ def issue_certificate(
 
     # Extended Key Usage
     eku = ExtendedKeyUsage(
-        [ExtendedKeyUsageOID.SERVER_AUTH if is_server else ExtendedKeyUsageOID.CLIENT_AUTH]
+        [
+            ExtendedKeyUsageOID.SERVER_AUTH
+            if is_server
+            else ExtendedKeyUsageOID.CLIENT_AUTH
+        ]
     )
     cert_builder = cert_builder.add_extension(eku, critical=False)
 
@@ -103,7 +107,9 @@ def issue_certificate(
     )
 
     # Sign the certificate
-    certificate = cert_builder.sign(private_key=ca_private_key, algorithm=hashes.SHA256())
+    certificate = cert_builder.sign(
+        private_key=ca_private_key, algorithm=hashes.SHA256()
+    )
     certificate_pem = certificate.public_bytes(serialization.Encoding.PEM)
 
     return certificate_pem
@@ -124,9 +130,7 @@ def save_key(public_key, private_key, party: str):
             private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.BestAvailableEncryption(
-                    b"my_secure_password"
-                ),
+                encryption_algorithm=serialization.NoEncryption(),
             )
         )
 
