@@ -118,6 +118,9 @@ class Server:
                         reply = {"status": "ok", "msg": "login successful"}
                     else:
                         reply = {"status": "error", "msg": "invalid credentials"}
+                elif payload["type"] == "chat":
+                    print(f"[Chat from {addr}]: {payload['msg']}")
+                    reply = {"status": "ok", "msg": "Message received"}
                 else:
                     reply = {"status": "error", "msg": "unknown request"}
 

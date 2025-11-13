@@ -1,6 +1,5 @@
 import socket
 import json
-import os
 import base64
 import secrets
 import hashlib
@@ -93,7 +92,7 @@ class Client:
         print("\n1) Register\n2) Login\n3) Quit")
         ch = input("Choice: ").strip()
         if ch == "3":
-            break
+            return
 
         username = input("Username: ").strip()
         password = input("Password: ").strip()
@@ -109,7 +108,11 @@ class Client:
         ts = int(time.time() * 1000)
         seqno = secrets.randbelow(100000)
         digest = hashlib.sha256(f"{seqno}{ts}".encode() + ct).digest()
-        sig = self.private_key.sign(digest, padding.PKCS1v15(), hashes.SHA256())
+        sig = self.private_key.sign(
+            digest,
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
 
         msg = {
             "type": "msg",
@@ -122,7 +125,7 @@ class Client:
 
         resp = recv_msg(s)
         if not resp:
-            break
+            return
         ct = base64.b64decode(resp["ct"])
         plaintext = aes_decrypt(session_key, ct).decode()
         print("[Server reply]:", plaintext)
@@ -132,9 +135,34 @@ class Client:
             ch = input("Choice: ").strip()
             if ch == "2":
                 break
-
-            message  = input("input msg: ").strip()
-            
+            message = input("input msg: ").strip()
+            payload = {
+                "type": "chat",
+                "msg": message,
+            }
+            ct = aes_encrypt(session_key, json.dumps(payload).encode())
+            ts = int(time.time() * 1000)
+            seqno += 1
+            digest = hashlib.sha256(f"{seqno}{ts}".encode() + ct).digest()
+            sig = self.private_key.sign(
+                digest,
+                padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+            msg = {
+                "type": "msg",
+                "seqno": seqno,
+                "ts": ts,
+                "ct": base64.b64encode(ct).decode(),
+                "sig": base64.b64encode(sig).decode(),
+            }
+            send_msg(s, msg)
+            resp = recv_msg(s)
+            if not resp:
+                break
+            ct = base64.b64decode(resp["ct"])
+            plaintext = aes_decrypt(session_key, ct).decode()
+            print("[Server reply]:", plaintext)
 
 
 if __name__ == "__main__":
